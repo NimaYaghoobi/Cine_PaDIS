@@ -1,0 +1,11 @@
+# checkpoints / models
+checkpoint*/
+checkpoints/
+*.pkl
+*.pth
+*.ckpt
+
+# python
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
