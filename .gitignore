@@ -1,4 +1,4 @@
-# checkpoints / models
+# models / checkpoints
 checkpoint*/
 checkpoints/
 *.pkl
@@ -9,3 +9,4 @@ checkpoints/
 __pycache__/
 .ipynb_checkpoints/
 .DS_Store
+

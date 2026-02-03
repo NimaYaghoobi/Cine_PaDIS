@@ -1,0 +1,473 @@
+# ---------------------------------------------------------------
+# Modified from:
+# https://github.com/jasonhu4/PaDIS/blob/main/training/training_loop.py
+#
+# The license for the original version of this file can be
+# found here: https://github.com/jasonhu4/PaDIS/blob/main/LICENSE.
+# ---------------------------------------------------------------
+
+"""Main training loop."""
+
+import os
+import sys
+import time
+import copy
+import json
+import pickle
+import psutil
+import numpy as np
+import torch
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+import dnnlib
+from torch_utils import distributed as dist
+from torch_utils import training_stats
+from torch_utils import misc
+import torchvision.utils as vutils
+import wandb
+
+
+from training.patch_loss import Patch_EDMLoss
+from diffusers import AutoencoderKL
+
+import torch
+import torch.nn.functional as F
+import numpy as np
+import tqdm
+import random
+
+sys.path.append(os.path.dirname(__file__))
+from dataset import ImageFolderDatasetX
+from uncond_gen import dps_uncond
+
+def set_requires_grad(model, value):
+    for param in model.parameters():
+        param.requires_grad = value
+        
+    
+#----------------------------------------------------------------------------
+
+def training_loop(
+    run_dir             = '.',      # Output directory.
+    dataset_kwargs      = {},       # Options for training set.
+    data_loader_kwargs  = {},       # Options for torch.utils.data.DataLoader.
+    network_kwargs      = {},       # Options for model and preconditioning.
+    loss_kwargs         = {},       # Options for loss function.
+    optimizer_kwargs    = {},       # Options for optimizer.
+    augment_kwargs      = None,     # Options for augmentation pipeline, None = disable.
+    seed                = 0,        # Global random seed.
+    batch_size          = 512,      # Total batch size for one training iteration.
+    batch_gpu           = None,     # Limit batch size per GPU, None = no limit.
+    total_kimg          = 200000,   # Training duration, measured in thousands of training images.
+    ema_halflife_kimg   = 500,      # Half-life of the exponential moving average (EMA) of model weights.
+    ema_rampup_ratio    = 0.05,     # EMA ramp-up coefficient, None = no rampup.
+    lr_rampup_kimg      = 10000,    # Learning rate ramp-up duration.
+    loss_scaling        = 1,        # Loss scaling factor for reducing FP16 under/overflows.
+    kimg_per_tick       = 50,       # Interval of progress prints.
+    snapshot_ticks      = 50,       # How often to save network snapshots, None = disable.
+    state_dump_ticks    = 500,      # How often to dump training state, None = disable.
+    resume_pkl          = None,     # Start from the given network snapshot, None = random initialization.
+    resume_state_dump   = None,     # Start from the given training state, None = reset training state.
+    resume_kimg         = 0,        # Start from the given training progress.
+    cudnn_benchmark     = True,     # Enable torch.backends.cudnn.benchmark?
+    real_p              = 0.5,      # Probability of using the largest patch size
+    train_on_latents    = False,    # Always keep as false
+    progressive         = False,
+    padding             = 0,        # Whether to use zero padding
+    # pad_width           = 0,       # Width of zero padding on each side
+
+    pad_y = 0, # Zero padding on top/bottom
+    pad_x = 0, # Zero padding on left/right
+    
+    device              = torch.device('cuda'),
+    four_channels = 1,              # Always keep as 1
+    hash_channels = 1,              # Always keep as 1
+    patch_list=None,
+    patch_probs=None,
+):
+    start_time = time.time()
+    np.random.seed((seed * dist.get_world_size() + dist.get_rank()) % (1 << 31))
+    torch.manual_seed(np.random.randint(1 << 31))
+    torch.backends.cudnn.benchmark = cudnn_benchmark
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    
+    # wandb init added
+    # if dist.get_rank() == 0:  
+    #     wandb.init(
+    #         project="PaDIS-MRI",
+    #         config={
+    #             "total_kimg": total_kimg
+    #         },
+    #     )
+
+
+    wandb_enabled = (dist.get_rank() == 0) and (os.environ.get("WANDB_MODE", "").lower() != "disabled")
+    if wandb_enabled:
+        wandb.init(
+            project="PaDIS-MRI",
+            config={"total_kimg": total_kimg},
+        )
+
+
+    # per gpu batch size
+    batch_gpu_total = batch_size // dist.get_world_size()
+    if batch_gpu is None or batch_gpu > batch_gpu_total:
+        batch_gpu = batch_gpu_total
+    num_accumulation_rounds = batch_gpu_total // batch_gpu
+    assert batch_size == batch_gpu * num_accumulation_rounds * dist.get_world_size()
+
+    # Load dataset.
+    dist.print0('Loading dataset...')
+
+    mypath = dataset_kwargs.get('path', '/data/datasets/fastmri/brain_train_t2_d384_s500/32dB') + f'/noisy.pt'
+    # imsize = 384
+    # dataset_obj = ImageFolderDatasetX(mypath, imsize + 2*pad_width, pad=pad_width, channels=2, imsize=imsize)
+
+    imH, imW = 246, 384
+    # dataset_obj = ImageFolderDatasetX(mypath, (imH + 2*pad_width, imW + 2*pad_width), pad=pad_width, channels=2, imsize=(imH, imW))
+
+    dataset_obj = ImageFolderDatasetX(mypath, (imH + 2*pad_y, imW + 2*pad_x), pad=(pad_y, pad_x), channels=2, imsize=(imH, imW))
+    
+    dataset_sampler = misc.InfiniteSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), seed=seed)
+    dataset_iterator = iter(torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
+
+    # img_resolution, img_channels = dataset_obj.resolution, dataset_obj.num_channels ###############################
+    # img_channels = dataset_obj.num_channels
+    img_resolution = 256
+
+    Lt = int(loss_kwargs.get('t_patch', 0))
+    assert Lt > 0, "Set loss_kwargs.t_patch (Lt) > 0 for cine mode."
+    img_channels = 2 * Lt                 # network input image channels
+    pos_channels = 2 + Lt                 # x,y plus Lt time-pos channels
+
+    if train_on_latents:
+        img_vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema").to(device)
+        img_vae.eval()
+        set_requires_grad(img_vae, False)
+        latent_scale_factor = 0.18215
+        # img_resolution, img_channels = dataset_obj.resolution // 8, 4#############################
+        img_resolution, img_channels = 256 // 8, 4
+    else:
+        img_vae = None
+
+    # Construct network.
+    dist.print0('Constructing network...')
+    if not four_channels==1:
+        net_input_channels = img_channels + 2*four_channels
+    elif not hash_channels==1:
+        net_input_channels = img_channels + hash_channels
+    else:
+        # PaDIS-MRI case (two channels + positional encodings for real, complex)
+        # net_input_channels = img_channels + 2 # this accounts for positional encodings, which are concatenated in channel dimension.
+        net_input_channels = img_channels + pos_channels
+    
+    interface_kwargs = dict(img_resolution=img_resolution,
+                            img_channels=net_input_channels,
+                            # out_channels=4 if train_on_latents else dataset_obj.num_channels
+                            out_channels=4 if train_on_latents else img_channels,
+                            label_dim=dataset_obj.label_dim)
+    print(network_kwargs)
+    print(interface_kwargs)
+    net = dnnlib.util.construct_class_by_name(**network_kwargs, **interface_kwargs) # subclass of torch.nn.Module
+    net.train().requires_grad_(True).to(device)
+
+    if dist.get_rank() == 0:
+        with torch.no_grad():
+            # images = torch.zeros([batch_gpu, img_channels, net.img_resolution, net.img_resolution], device=device)
+            # sigma = torch.ones([batch_gpu], device=device)
+            # x_pos = torch.zeros([batch_gpu, 2, net.img_resolution, net.img_resolution], device=device)
+            # labels = torch.zeros([batch_gpu, net.label_dim], device=device)
+            # print(f"Shape of images: {images[:,:,pad_width:imsize+pad_width, pad_width:imsize+pad_width].shape}")  # Should be [batch_size, 2, 384, 384]
+
+            # misc.print_module_summary(net, [images[:,:,pad_width:imsize+pad_width, pad_width:imsize+pad_width], sigma, x_pos[:,:,pad_width:imsize+pad_width, pad_width:imsize+pad_width], labels], max_nesting=2)
+
+            # images = torch.zeros([batch_gpu, img_channels, imH + 2*pad_width, imW + 2*pad_width], device=device)
+            # sigma = torch.ones([batch_gpu], device=device)
+            # x_pos = torch.zeros([batch_gpu, 2, imH + 2*pad_width, imW + 2*pad_width], device=device)
+            # labels = torch.zeros([batch_gpu, net.label_dim], device=device)
+            
+            # print(f"Shape of images: {images[:,:,pad_width:pad_width+imH, pad_width:pad_width+imW].shape}")
+
+
+            images = torch.zeros([batch_gpu, img_channels, imH + 2*pad_y, imW + 2*pad_x], device=device)
+            sigma = torch.ones([batch_gpu], device=device)
+            # x_pos = torch.zeros([batch_gpu, 2, imH + 2*pad_y, imW + 2*pad_x], device=device)
+            x_pos = torch.zeros([batch_gpu, pos_channels, imH + 2*pad_y, imW + 2*pad_x], device=device)
+            labels = torch.zeros([batch_gpu, net.label_dim], device=device)
+            
+            print(f"Shape of images: {images[:,:,pad_y:pad_y+imH, pad_x:pad_x+imW].shape}")
+            
+            # misc.print_module_summary(
+            #     net,
+            #     [images[:,:,pad_width:pad_width+imH, pad_width:pad_width+imW],
+            #      sigma,
+            #      x_pos[:,:,pad_width:pad_width+imH, pad_width:pad_width+imW],
+            #      labels],
+            #     max_nesting=2
+            # )
+
+            
+    # Setup optimizer.
+    dist.print0('Setting up optimizer...')
+    loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs) # training.loss.(VP|VE|EDM)Loss
+    optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
+    augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
+    ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device], broadcast_buffers=False)
+    ema = copy.deepcopy(net).eval().requires_grad_(False)
+
+    # Resume training from previous snapshot.
+    if resume_pkl is not None:
+        dist.print0(f'Loading network weights from "{resume_pkl}"...')
+        if dist.get_rank() != 0:
+            torch.distributed.barrier() # rank 0 goes first
+        with dnnlib.util.open_url(resume_pkl, verbose=(dist.get_rank() == 0)) as f:
+            data = pickle.load(f)
+        if dist.get_rank() == 0:
+            torch.distributed.barrier() # other ranks follow
+        misc.copy_params_and_buffers(src_module=data['ema'], dst_module=net, require_all=False)
+        misc.copy_params_and_buffers(src_module=data['ema'], dst_module=ema, require_all=False)
+        del data # conserve memory
+    if resume_state_dump:
+        dist.print0(f'Loading training state from "{resume_state_dump}"...')
+        data = torch.load(resume_state_dump, map_location=torch.device('cpu'))
+        misc.copy_params_and_buffers(src_module=data['net'], dst_module=net, require_all=True)
+        optimizer.load_state_dict(data['optimizer_state'])
+        del data # conserve memory
+
+    # Train.
+    dist.print0(f'Training for {total_kimg} kimg...')
+    dist.print0()
+    cur_nimg = resume_kimg * 1000
+    cur_tick = 0
+    tick_start_nimg = cur_nimg
+    tick_start_time = time.time()
+    maintenance_time = tick_start_time - start_time
+    dist.update_progress(cur_nimg // 1000, total_kimg)
+    stats_jsonl = None
+    batch_mul_dict = {512: 1, 256: 1, 128: 4, 96: 8, 64: 16, 56: 16, 48: 16, 32: 32, 24: 32, 16: 64}
+    # added for full image: 
+    if padding == 0: batch_mul_dict[img_resolution] = 1
+    
+    user_supplied = (patch_list is not None) and (patch_probs is not None)
+    if user_supplied:
+        patch_list = np.array([int(x) for x in patch_list], dtype=int)
+        p_list = np.array([float(x) for x in patch_probs], dtype=float)
+        assert len(patch_list) == len(p_list), "patch_list and patch_probs must have the same length."
+        assert np.all(patch_list > 0), "patch sizes must be positive integers."
+
+        s = p_list.sum()
+        if s <= 0:
+            raise ValueError("patch_probs must sum to a positive value.")
+        p_list = p_list / s  
+
+        for ps in patch_list:
+            if int(ps) not in batch_mul_dict:
+                raise ValueError("Unknown patch size encountered. Must be one of the following: " + str(list(batch_mul_dict.keys())))
+
+        batch_mul_avg = float(np.sum([p * batch_mul_dict.get(int(ps), 1) for ps, p in zip(patch_list, p_list)]))
+    else:
+        if train_on_latents:
+            p_list = np.array([(1 - real_p), real_p])
+            patch_list = np.array([img_resolution // 2, img_resolution])
+            batch_mul_avg = np.sum(p_list * np.array([2, 1]))
+        else:
+            p_list = np.array([(1-real_p)*2/5, (1-real_p)*3/5, real_p])
+            if padding:
+                patch_list = np.array([16, 32, 64])
+            else:
+                # full image only
+                patch_list = np.array([img_resolution])
+                p_list     = np.array([1.0])
+                
+            batch_mul_avg = np.sum(np.array(p_list) * np.array([4, 2, 1]))  # 2
+            
+    while True:
+
+        # Accumulate gradients.
+        optimizer.zero_grad(set_to_none=True)
+        for round_idx in range(num_accumulation_rounds):
+            with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
+                if progressive:
+                    p_cumsum = p_list.cumsum()
+                    p_cumsum[-1] = 10.
+                    prog_mask = (cur_nimg // 1000 / total_kimg) <= p_cumsum
+                    patch_size = int(patch_list[prog_mask][0])
+                    batch_mul_avg = batch_mul_dict[patch_size] // batch_mul_dict[img_resolution]
+                else:
+                    patch_size = int(np.random.choice(patch_list, p=p_list))
+
+                batch_mul = batch_mul_dict[patch_size] #// batch_mul_dict[img_resolution]
+                images, labels = [], []
+                for _ in range(batch_mul):
+                    images_, labels_ = next(dataset_iterator)
+                    images.append(images_), labels.append(labels_)
+                images, labels = torch.cat(images, dim=0), torch.cat(labels, dim=0)
+                del images_, labels_
+                images = images.to(device).to(torch.float32)
+
+                if train_on_latents:
+                    with torch.no_grad():
+                        images = img_vae.encode(images)['latent_dist'].sample()
+                        images = latent_scale_factor * images
+
+                labels = labels.to(device)
+                
+                #added for full-image support
+                if isinstance(loss_fn, Patch_EDMLoss):
+                    loss = loss_fn(net=ddp, images=images, patch_size=patch_size, resolution=img_resolution,
+                               labels=labels, augment_pipe=augment_pipe)
+                else:
+                    loss = loss_fn(net=ddp, images=images, labels=labels, augment_pipe=augment_pipe)
+
+                training_stats.report('Loss/loss', loss)
+                loss.sum().mul(loss_scaling / batch_gpu_total / batch_mul).backward()
+
+        # Update weights.
+        for g in optimizer.param_groups:
+            g['lr'] = optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
+        for param in net.parameters():
+            if param.grad is not None:
+                torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
+        optimizer.step()
+
+        # Update EMA.
+        ema_halflife_nimg = ema_halflife_kimg * 1000
+        if ema_rampup_ratio is not None:
+            ema_halflife_nimg = min(ema_halflife_nimg, cur_nimg * ema_rampup_ratio)
+        ema_beta = 0.5 ** (batch_size * batch_mul_avg / max(ema_halflife_nimg, 1e-8))
+        for p_ema, p_net in zip(ema.parameters(), net.parameters()):
+            p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
+
+        # Perform maintenance tasks once per tick.
+        cur_nimg += int(batch_size * batch_mul_avg)
+        done = (cur_nimg >= total_kimg * 1000)
+        if (not done) and (cur_tick != 0) and (cur_nimg < tick_start_nimg + kimg_per_tick * 1000):
+            continue
+
+        # Print status line, accumulating the same information in training_stats.
+        tick_end_time = time.time()
+        fields = []
+        fields += [f"tick {training_stats.report0('Progress/tick', cur_tick):<5d}"]
+        fields += [f"kimg {training_stats.report0('Progress/kimg', cur_nimg / 1e3):<9.1f}"]
+        fields += [f"loss {loss.mean().item():<9.3f}"]
+        fields += [f"time {dnnlib.util.format_time(training_stats.report0('Timing/total_sec', tick_end_time - start_time)):<12s}"]
+        fields += [f"sec/tick {training_stats.report0('Timing/sec_per_tick', tick_end_time - tick_start_time):<7.1f}"]
+        fields += [f"sec/kimg {training_stats.report0('Timing/sec_per_kimg', (tick_end_time - tick_start_time) / (cur_nimg - tick_start_nimg) * 1e3):<7.2f}"]
+        fields += [f"maintenance {training_stats.report0('Timing/maintenance_sec', maintenance_time):<6.1f}"]
+        fields += [f"cpumem {training_stats.report0('Resources/cpu_mem_gb', psutil.Process(os.getpid()).memory_info().rss / 2**30):<6.2f}"]
+        fields += [f"gpumem {training_stats.report0('Resources/peak_gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 2**30):<6.2f}"]
+        fields += [f"reserved {training_stats.report0('Resources/peak_gpu_mem_reserved_gb', torch.cuda.max_memory_reserved(device) / 2**30):<6.2f}"]
+        torch.cuda.reset_peak_memory_stats()
+        dist.print0(' '.join(fields))
+        
+        # if dist.get_rank() == 0: 
+        #     wandb.log({
+        #         "loss": loss.mean().item(),
+        #         "kimg": cur_nimg / 1e3,
+        #         "tick": cur_tick,
+        #     }, step=cur_nimg)
+
+        if wandb_enabled:
+            wandb.log({
+                "loss": loss.mean().item(),
+                "kimg": cur_nimg / 1e3,
+                "tick": cur_tick,
+            }, step=cur_nimg)
+
+        
+
+        # Check for abort.
+        if (not done) and dist.should_stop():
+            done = True
+            dist.print0()
+            dist.print0('Aborting...')
+
+        # Save network snapshot.
+        if (snapshot_ticks is not None) and (done or cur_tick % snapshot_ticks == 0):
+            data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
+            for key, value in data.items():
+                if isinstance(value, torch.nn.Module):
+                    value = copy.deepcopy(value).eval().requires_grad_(False)
+                    misc.check_ddp_consistency(value)
+                    data[key] = value.cpu()
+                del value # conserve memory
+            if dist.get_rank() == 0:
+                with open(os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl'), 'wb') as f:
+                    pickle.dump(data, f)
+                    
+                samples_cplx = dps_uncond(
+                    net=ema,           # or net, but typically EMA is used for sampling
+                    batch_size=1,      # small batch
+                    # resolution=384,    # match training
+                    resolution=(imH, imW),    # match training
+                    # psize=96,
+                    # pad=96,
+                    psize=int(np.max(patch_list)),
+                    pad=(pad_y, pad_x),
+                    
+                    num_steps=65,      # fewer steps for speed
+                    sigma_min=0.003,
+                    sigma_max=10,
+                    rho=7,
+                    device=device,
+                )
+                
+                # samples_cpu = samples_cplx.cpu()
+                # wandb_images = []
+                
+                # for i, cplx_im in enumerate(samples_cpu):
+                #     mag = torch.abs(cplx_im.squeeze(0)).numpy()
+                #     wandb_images.append(wandb.Image(mag, caption=f"Uncond Sample {i} (mag)"))
+                    
+                # wandb.log({"uncond_samples": wandb_images}, step=cur_nimg)
+
+                samples_cpu = samples_cplx.cpu()
+                
+                if wandb_enabled:
+                    wandb_images = []
+                    for i, x in enumerate(samples_cpu):
+                        # x: [C,H,W] where C=2*t_patch (e.g. 8)
+                        C, H, W = x.shape
+                
+                        if C % 2 == 0:
+                            real = x[0::2]
+                            imag = x[1::2]
+                            mag_frames = torch.sqrt(real**2 + imag**2)   # [Lt,H,W]
+                            mag2d = mag_frames.mean(dim=0)               # [H,W] (average over time)
+                        else:
+                            mag2d = x.abs().mean(dim=0)                  # fallback
+                
+                        wandb_images.append(wandb.Image(mag2d.numpy(), caption=f"Uncond Sample {i} (mean-mag)"))
+                
+                    wandb.log({"uncond_samples": wandb_images}, step=cur_nimg)
+
+                        
+            del data 
+
+        # Save full dump of the training state.
+        if (state_dump_ticks is not None) and (done or cur_tick % state_dump_ticks == 0) and cur_tick != 0 and dist.get_rank() == 0:
+            torch.save(dict(net=net, optimizer_state=optimizer.state_dict()), os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt'))
+
+        # Update logs.
+        training_stats.default_collector.update()
+        if dist.get_rank() == 0:
+            if stats_jsonl is None:
+                stats_jsonl = open(os.path.join(run_dir, 'stats.jsonl'), 'at')
+            stats_jsonl.write(json.dumps(dict(training_stats.default_collector.as_dict(), timestamp=time.time())) + '\n')
+            stats_jsonl.flush()
+        dist.update_progress(cur_nimg // 1000, total_kimg)
+
+        # Update state.
+        cur_tick += 1
+        tick_start_nimg = cur_nimg
+        tick_start_time = time.time()
+        maintenance_time = tick_start_time - tick_end_time
+        if done:
+            break
+
+    # Done.
+    dist.print0()
+    dist.print0('Exiting...')
+
+#----------------------------------------------------------------------------
