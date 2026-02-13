@@ -1,5 +1,0 @@
-{
-  "PaDIS": { "t1": "/home/rohan/mri/mri_padis100_checkpoint1451_new_t1_R8_10/mask_10/new_plots/results.json" },
-  "EDM":   { "t1": "/home/rohan/mri/mri_edm100_checkpoint650_new_t1_R2_4_6_8_10/mask_10/new_plots/results.json" },
-  "PICS":  { "t1": "/home/rohan/mri/mri_admm_new_t1_R2_4_6_8_10/mask_10/new_plots/results.json" }
-}
