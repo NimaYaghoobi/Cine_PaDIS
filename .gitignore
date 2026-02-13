@@ -1,0 +1,19 @@
+# big outputs / datasets
+runs/
+results/
+data/
+checkpoint*/
+*.ckpt
+*.pth
+*.pt
+*.pkl
+*.npz
+*.h5
+*.mat
+*.nii
+*.nii.gz
+
+# python stuff
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
